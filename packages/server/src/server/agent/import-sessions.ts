@@ -291,12 +291,9 @@ async function importProviderSessionNow(
         timelineSize: input.agentManager.getTimeline(snapshot.id).length,
       };
     } catch (error) {
-      await rollbackArchivedImport(
-        input,
-        archivedRecord,
-        archivedRecord.archivedAt,
-        retained.restored,
-      );
+      await rollbackArchivedImport(input, archivedRecord, archivedRecord.archivedAt, {
+        restoredWorkspace: retained.restored,
+      });
       throw error;
     }
   }
@@ -360,7 +357,7 @@ async function rollbackArchivedImport(
   input: ImportProviderSessionInput,
   archivedRecord: StoredAgentRecord,
   archivedAt: string,
-  restoredWorkspace: PersistedWorkspaceRecord | null = null,
+  { restoredWorkspace = null }: { restoredWorkspace?: PersistedWorkspaceRecord | null } = {},
 ): Promise<void> {
   if (restoredWorkspace?.archivedAt) {
     // The import unarchived this workspace for an agent that never loaded, so it

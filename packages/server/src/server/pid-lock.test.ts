@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, open, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, rm, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
@@ -7,8 +7,8 @@ import {
   acquirePidLock,
   getPidLockInfo,
   isLocked,
-  isSameFileEntry,
   PidLockError,
+  type PidLockFileSystem,
   refreshPidLock,
   releasePidLock,
   updatePidLock,
@@ -318,117 +318,151 @@ describe("pid-lock recovery from a lock file with no readable owner", () => {
  * decided about. The interleaving itself is a few instructions wide, so the
  * predicate is exercised directly against real files.
  */
-describe("pid-lock file identity", () => {
-  test("an untouched file is the same entry when stat'ed again", async () => {
-    const home = await mkdtemp(join(tmpdir(), "paseo-pid-same-"));
-    try {
-      const path = join(home, "paseo.pid");
-      await writeFile(path, "");
+describe("pid-lock recovery leaves an entry it no longer recognises", () => {
+  /**
+   * The recovery path reads the lock through a handle and then deletes the path.
+   * Anything that replaces the file in between would be deleted anyway unless the
+   * entry is re-checked, and a valid lock deleted underneath its owner is how two
+   * daemons end up both believing they hold the path. That window is a few
+   * instructions wide, so the filesystem calls are injected to open it on demand.
+   */
+  function fileSystemWith(overrides: Partial<PidLockFileSystem>): PidLockFileSystem {
+    return { open, stat, unlink, ...overrides };
+  }
 
-      expect(isSameFileEntry(await stat(path), await stat(path))).toBe(true);
+  test("declines to delete a lock whose entry changed since it was read", async () => {
+    const paseoHome = await mkdtemp(join(tmpdir(), "paseo-pid-lock-swapped-"));
+    try {
+      const pidPath = join(paseoHome, "paseo.pid");
+      await writeFile(pidPath, "");
+      // Something else's entry, standing in for the file that replaced this one
+      // between the read and the delete.
+      const other = join(paseoHome, "other");
+      await writeFile(other, "x");
+      const deleted: string[] = [];
+
+      await expect(
+        acquirePidLock(paseoHome, null, {
+          ownerPid: process.pid + 10_000,
+          fileSystem: fileSystemWith({
+            stat: async () => await stat(other),
+            unlink: async (path) => {
+              deleted.push(path);
+            },
+          }),
+        }),
+      ).rejects.toThrow(PidLockError);
+
+      expect(deleted).toEqual([]);
+      expect((await stat(pidPath)).isFile()).toBe(true);
     } finally {
-      await rm(home, { recursive: true, force: true });
+      await rm(paseoHome, { recursive: true, force: true });
     }
   });
 
-  test("a file written to since the first stat is not the same entry", async () => {
-    const home = await mkdtemp(join(tmpdir(), "paseo-pid-written-"));
+  // One field at a time, so each part of the comparison has to be load-bearing on
+  // its own: a replacement changes the inode, a fill-in changes size and time, and
+  // a move between filesystems changes the device.
+  test.each([
+    ["device", { dev: 1 }],
+    ["inode", { ino: 1 }],
+    ["size", { size: 1 }],
+    ["modification time", { mtimeMs: 1 }],
+  ])("declines when only the %s differs", async (_label, delta) => {
+    const paseoHome = await mkdtemp(join(tmpdir(), "paseo-pid-lock-field-"));
     try {
-      // What the daemon that created the empty lock does a moment later.
-      const path = join(home, "paseo.pid");
-      await writeFile(path, "");
-      const beforeWrite = await stat(path);
+      const pidPath = join(paseoHome, "paseo.pid");
+      await writeFile(pidPath, "");
+      const deleted: string[] = [];
 
-      await writeFile(path, JSON.stringify({ pid: 4242 }));
+      await expect(
+        acquirePidLock(paseoHome, null, {
+          ownerPid: process.pid + 10_000,
+          fileSystem: fileSystemWith({
+            stat: async (path) => {
+              const real = await stat(path);
+              const [[field, step]] = Object.entries(delta);
+              return Object.assign(real, {
+                [field]: (real[field as keyof typeof real] as number) + step,
+              });
+            },
+            unlink: async (path) => {
+              deleted.push(path);
+            },
+          }),
+        }),
+      ).rejects.toThrow(PidLockError);
 
-      expect(isSameFileEntry(beforeWrite, await stat(path))).toBe(false);
+      expect(deleted).toEqual([]);
     } finally {
-      await rm(home, { recursive: true, force: true });
+      await rm(paseoHome, { recursive: true, force: true });
     }
   });
 
-  test("a file rewritten to the same length at a new time is not the same entry", async () => {
-    const home = await mkdtemp(join(tmpdir(), "paseo-pid-retouched-"));
+  test("deletes the lock when the entry is the one it read", async () => {
+    const paseoHome = await mkdtemp(join(tmpdir(), "paseo-pid-lock-same-"));
+    const ownerPid = process.pid + 10_000;
     try {
-      const path = join(home, "paseo.pid");
-      await writeFile(path, "aaaa");
-      const beforeRewrite = await stat(path);
+      await writeFile(join(paseoHome, "paseo.pid"), "");
+      const deleted: string[] = [];
 
-      await writeFile(path, "bbbb");
-      const later = new Date(beforeRewrite.mtimeMs + 5_000);
-      await utimes(path, later, later);
+      await acquirePidLock(paseoHome, null, {
+        ownerPid,
+        fileSystem: fileSystemWith({
+          unlink: async (path) => {
+            deleted.push(path);
+            await unlink(path);
+          },
+        }),
+      });
 
-      expect(isSameFileEntry(beforeRewrite, await stat(path))).toBe(false);
+      expect(deleted).toEqual([join(paseoHome, "paseo.pid")]);
+      expect((await getPidLockInfo(paseoHome))?.pid).toBe(ownerPid);
     } finally {
-      await rm(home, { recursive: true, force: true });
+      await rm(paseoHome, { recursive: true, force: true });
     }
   });
 
-  test("a rewrite that keeps the inode and the time is caught by the size", async () => {
-    const home = await mkdtemp(join(tmpdir(), "paseo-pid-grew-"));
+  test("surfaces an unlink failure instead of acquiring over it", async () => {
+    const paseoHome = await mkdtemp(join(tmpdir(), "paseo-pid-lock-undeletable-"));
     try {
-      // Exactly the case the guard exists for: the daemon that created the
-      // empty lock fills it in. Same file, same clock reading, more bytes.
-      // Pin the time on both sides: utimes rounds to whole milliseconds, so a
-      // time read back from stat cannot be written again unchanged.
-      const pinned = new Date(1_700_000_000_000);
-      const path = join(home, "paseo.pid");
-      await writeFile(path, "");
-      await utimes(path, pinned, pinned);
-      const beforeFill = await stat(path);
+      await writeFile(join(paseoHome, "paseo.pid"), "");
+      const refusal = Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
 
-      await writeFile(path, JSON.stringify({ pid: 4242 }));
-      await utimes(path, pinned, pinned);
-
-      const afterFill = await stat(path);
-      expect(afterFill.ino).toBe(beforeFill.ino);
-      expect(afterFill.mtimeMs).toBe(beforeFill.mtimeMs);
-      expect(isSameFileEntry(beforeFill, afterFill)).toBe(false);
+      await expect(
+        acquirePidLock(paseoHome, null, {
+          ownerPid: process.pid + 10_000,
+          fileSystem: fileSystemWith({
+            unlink: async () => {
+              throw refusal;
+            },
+          }),
+        }),
+      ).rejects.toBe(refusal);
     } finally {
-      await rm(home, { recursive: true, force: true });
+      await rm(paseoHome, { recursive: true, force: true });
     }
   });
 
-  test("a replacement that keeps the size and the time is caught by the inode", async () => {
-    const home = await mkdtemp(join(tmpdir(), "paseo-pid-swapped-"));
+  test("treats a vanished entry as already cleared", async () => {
+    const paseoHome = await mkdtemp(join(tmpdir(), "paseo-pid-lock-vanished-"));
+    const ownerPid = process.pid + 10_000;
     try {
-      // Another daemon's exclusive create after the file was removed. Nothing
-      // but the inode distinguishes it from the file that was read.
-      const pinned = new Date(1_700_000_000_000);
-      const path = join(home, "paseo.pid");
-      await writeFile(path, "");
-      await utimes(path, pinned, pinned);
-      const beforeSwap = await stat(path);
+      await writeFile(join(paseoHome, "paseo.pid"), "");
 
-      await rm(path);
-      await writeFile(path, "");
-      await utimes(path, pinned, pinned);
+      await acquirePidLock(paseoHome, null, {
+        ownerPid,
+        fileSystem: fileSystemWith({
+          unlink: async (path) => {
+            await unlink(path);
+            throw Object.assign(new Error("ENOENT: no such file"), { code: "ENOENT" });
+          },
+        }),
+      });
 
-      const afterSwap = await stat(path);
-      expect(afterSwap.size).toBe(beforeSwap.size);
-      expect(afterSwap.mtimeMs).toBe(beforeSwap.mtimeMs);
-      expect(afterSwap.ino).not.toBe(beforeSwap.ino);
-      expect(isSameFileEntry(beforeSwap, afterSwap)).toBe(false);
+      expect((await getPidLockInfo(paseoHome))?.pid).toBe(ownerPid);
     } finally {
-      await rm(home, { recursive: true, force: true });
-    }
-  });
-
-  test("a replacement at the same path is not the same entry", async () => {
-    const home = await mkdtemp(join(tmpdir(), "paseo-pid-replaced-"));
-    try {
-      // What another daemon's exclusive create leaves after the file is gone:
-      // same path, same contents, different inode.
-      const path = join(home, "paseo.pid");
-      await writeFile(path, "");
-      const beforeReplace = await stat(path);
-
-      await rm(path);
-      await writeFile(path, "");
-
-      expect(isSameFileEntry(beforeReplace, await stat(path))).toBe(false);
-    } finally {
-      await rm(home, { recursive: true, force: true });
+      await rm(paseoHome, { recursive: true, force: true });
     }
   });
 });

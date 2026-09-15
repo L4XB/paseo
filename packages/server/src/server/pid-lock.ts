@@ -88,6 +88,8 @@ function resolveOwnerPid(ownerPid?: number): number {
 
 interface AcquirePidLockOptions {
   ownerPid?: number;
+  /** Injected only by the tests that drive the recovery path's read/delete race. */
+  fileSystem?: PidLockFileSystem;
 }
 
 export function isSamePidLock(left: PidLockInfo, right: PidLockInfo): boolean {
@@ -135,14 +137,27 @@ function holdsAPidLock(content: string): boolean {
 }
 
 /**
+ * The three filesystem calls the recovery path makes, as a port.
+ *
+ * The interleaving it guards against is a few instructions wide, so a test
+ * cannot produce it against the real filesystem. Injecting these lets one drive
+ * the entry changing between the read and the delete, through `acquirePidLock`
+ * rather than against an internal predicate.
+ */
+export interface PidLockFileSystem {
+  open(path: string, flags: string): Promise<FileHandle>;
+  stat(path: string): Promise<Stats>;
+  unlink(path: string): Promise<void>;
+}
+
+const realFileSystem: PidLockFileSystem = { open, stat, unlink };
+
+/**
  * Whether two stats describe the same file in the same state: the same
  * directory entry (device and inode) whose contents have not been rewritten
  * since (size and modification time).
- *
- * Exported for the tests, which is also the only way to exercise it: the
- * interleaving it guards against is a few instructions wide.
  */
-export function isSameFileEntry(left: Stats, right: Stats): boolean {
+function isSameFileEntry(left: Stats, right: Stats): boolean {
   return (
     left.dev === right.dev &&
     left.ino === right.ino &&
@@ -168,17 +183,17 @@ export function isSameFileEntry(left: Stats, right: Stats): boolean {
  * other than its contents, so a permission or I/O error still surfaces from
  * the caller's original error.
  */
-async function clearUnparseablePidLock(pidPath: string): Promise<boolean> {
+async function clearUnparseablePidLock(pidPath: string, fs: PidLockFileSystem): Promise<boolean> {
   let handle: FileHandle;
   try {
-    handle = await open(pidPath, "r");
+    handle = await fs.open(pidPath, "r");
   } catch {
     return false;
   }
 
   try {
     if (holdsAPidLock(await handle.readFile("utf-8"))) return false;
-    if (!isSameFileEntry(await handle.stat(), await stat(pidPath))) return false;
+    if (!isSameFileEntry(await handle.stat(), await fs.stat(pidPath))) return false;
   } catch {
     // The read or the re-check failed for a reason that is not the contents.
     return false;
@@ -187,7 +202,7 @@ async function clearUnparseablePidLock(pidPath: string): Promise<boolean> {
   }
 
   try {
-    await unlink(pidPath);
+    await fs.unlink(pidPath);
   } catch (error) {
     // Someone else removed it, which is the outcome this was after anyway.
     if (isErrnoException(error) && error.code === "ENOENT") return true;
@@ -233,7 +248,8 @@ export async function acquirePidLock(
   try {
     existingLock = await readPidLock(pidPath);
   } catch (error) {
-    if (!(await clearUnparseablePidLock(pidPath))) throw error;
+    if (!(await clearUnparseablePidLock(pidPath, options?.fileSystem ?? realFileSystem)))
+      throw error;
     existingLock = null;
   }
 

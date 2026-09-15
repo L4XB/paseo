@@ -125,6 +125,34 @@ async function clearExistingPidLock(
   return "cleared";
 }
 
+/**
+ * Remove a lock file that still holds no readable lock after readPidLock has
+ * exhausted its retries. Such a file names no pid, so no process can be shown
+ * to hold it, and nothing else ever deletes it: a daemon killed between the
+ * exclusive create and the write leaves an empty file behind that fails every
+ * later start the same way.
+ *
+ * Returns false and leaves the file alone when the read failed for a reason
+ * other than its contents, so a permission or I/O error still surfaces.
+ */
+async function clearUnparseablePidLock(pidPath: string): Promise<boolean> {
+  let content: string;
+  try {
+    content = await readFile(pidPath, "utf-8");
+  } catch {
+    return false;
+  }
+
+  try {
+    if (parsePidLockInfo(JSON.parse(content))) return false;
+  } catch {
+    // Not JSON at all; handled as unparseable below.
+  }
+
+  await unlink(pidPath).catch(() => {});
+  return true;
+}
+
 async function writeNewPidLock(pidPath: string, lockInfo: PidLockInfo): Promise<void> {
   let fd;
   try {
@@ -158,7 +186,13 @@ export async function acquirePidLock(
   ensurePrivateDirectory(paseoHome);
 
   // Try to read existing lock
-  const existingLock = await readPidLock(pidPath);
+  let existingLock: PidLockInfo | null;
+  try {
+    existingLock = await readPidLock(pidPath);
+  } catch (error) {
+    if (!(await clearUnparseablePidLock(pidPath))) throw error;
+    existingLock = null;
+  }
 
   // Check if existing lock is stale
   const lockOwnerPid = resolveOwnerPid(options?.ownerPid);

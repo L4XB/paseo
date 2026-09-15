@@ -1,4 +1,4 @@
-import { mkdtemp, open, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
@@ -252,6 +252,59 @@ describe("pid-lock ownership", () => {
       const lock = await getPidLockInfo(paseoHome);
       expect(lock?.pid).toBe(process.pid);
       expect(lock?.listen).toBe("127.0.0.1:6767");
+    } finally {
+      await rm(paseoHome, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("pid-lock recovery from a lock file with no readable owner", () => {
+  test("acquires the lock after a zero-byte lock file is left behind", async () => {
+    const paseoHome = await mkdtemp(join(tmpdir(), "paseo-pid-lock-empty-"));
+    const ownerPid = process.pid + 10_000;
+
+    try {
+      // What a daemon killed between the exclusive create and the write leaves.
+      await writeFile(join(paseoHome, "paseo.pid"), "");
+
+      await acquirePidLock(paseoHome, null, { ownerPid });
+
+      const lock = await getPidLockInfo(paseoHome);
+      expect(lock?.pid).toBe(ownerPid);
+      expect(lock?.heartbeat).toBe(true);
+    } finally {
+      await rm(paseoHome, { recursive: true, force: true });
+    }
+  });
+
+  test("acquires the lock after a lock file that parses but has no valid pid", async () => {
+    const paseoHome = await mkdtemp(join(tmpdir(), "paseo-pid-lock-truncated-"));
+    const ownerPid = process.pid + 10_000;
+
+    try {
+      await writeFile(join(paseoHome, "paseo.pid"), JSON.stringify({ pid: 0 }));
+
+      await acquirePidLock(paseoHome, null, { ownerPid });
+
+      expect((await getPidLockInfo(paseoHome))?.pid).toBe(ownerPid);
+    } finally {
+      await rm(paseoHome, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps the path and reports the failure when the lock cannot be read at all", async () => {
+    const paseoHome = await mkdtemp(join(tmpdir(), "paseo-pid-lock-unreadable-"));
+
+    try {
+      // A directory in place of the lock file fails the read for a reason that
+      // is not its contents, so it must not be treated as an abandoned lock.
+      await mkdir(join(paseoHome, "paseo.pid"));
+
+      await expect(
+        acquirePidLock(paseoHome, null, { ownerPid: process.pid + 10_000 }),
+      ).rejects.toThrow(PidLockError);
+
+      expect((await stat(join(paseoHome, "paseo.pid"))).isDirectory()).toBe(true);
     } finally {
       await rm(paseoHome, { recursive: true, force: true });
     }

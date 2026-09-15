@@ -1,5 +1,6 @@
-import { open, readFile, unlink, utimes } from "node:fs/promises";
+import { open, readFile, stat, unlink, utimes } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
+import type { Stats } from "node:fs";
 import { ensurePrivateDirectory } from "./private-files.js";
 import { join } from "node:path";
 import { hostname } from "node:os";
@@ -125,6 +126,31 @@ async function clearExistingPidLock(
   return "cleared";
 }
 
+function holdsAPidLock(content: string): boolean {
+  try {
+    return parsePidLockInfo(JSON.parse(content)) !== null;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether two stats describe the same file in the same state: the same
+ * directory entry (device and inode) whose contents have not been rewritten
+ * since (size and modification time).
+ *
+ * Exported for the tests, which is also the only way to exercise it: the
+ * interleaving it guards against is a few instructions wide.
+ */
+export function isSameFileEntry(left: Stats, right: Stats): boolean {
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.size === right.size &&
+    left.mtimeMs === right.mtimeMs
+  );
+}
+
 /**
  * Remove a lock file that still holds no readable lock after readPidLock has
  * exhausted its retries. Such a file names no pid, so no process can be shown
@@ -132,24 +158,41 @@ async function clearExistingPidLock(
  * exclusive create and the write leaves an empty file behind that fails every
  * later start the same way.
  *
+ * The read and the delete address the path separately, so the entry is
+ * re-checked against the handle the decision was made on. Without that, a
+ * daemon that filled in its own empty lock, or one that replaced the file,
+ * would have a valid lock deleted underneath it, and both daemons would then
+ * believe they hold the path.
+ *
  * Returns false and leaves the file alone when the read failed for a reason
- * other than its contents, so a permission or I/O error still surfaces.
+ * other than its contents, so a permission or I/O error still surfaces from
+ * the caller's original error.
  */
 async function clearUnparseablePidLock(pidPath: string): Promise<boolean> {
-  let content: string;
+  let handle: FileHandle;
   try {
-    content = await readFile(pidPath, "utf-8");
+    handle = await open(pidPath, "r");
   } catch {
     return false;
   }
 
   try {
-    if (parsePidLockInfo(JSON.parse(content))) return false;
+    if (holdsAPidLock(await handle.readFile("utf-8"))) return false;
+    if (!isSameFileEntry(await handle.stat(), await stat(pidPath))) return false;
   } catch {
-    // Not JSON at all; handled as unparseable below.
+    // The read or the re-check failed for a reason that is not the contents.
+    return false;
+  } finally {
+    await handle.close();
   }
 
-  await unlink(pidPath).catch(() => {});
+  try {
+    await unlink(pidPath);
+  } catch (error) {
+    // Someone else removed it, which is the outcome this was after anyway.
+    if (isErrnoException(error) && error.code === "ENOENT") return true;
+    throw error;
+  }
   return true;
 }
 

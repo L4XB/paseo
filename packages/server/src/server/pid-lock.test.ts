@@ -7,6 +7,7 @@ import {
   acquirePidLock,
   getPidLockInfo,
   isLocked,
+  isSameFileEntry,
   PidLockError,
   refreshPidLock,
   releasePidLock,
@@ -307,6 +308,127 @@ describe("pid-lock recovery from a lock file with no readable owner", () => {
       expect((await stat(join(paseoHome, "paseo.pid"))).isDirectory()).toBe(true);
     } finally {
       await rm(paseoHome, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * The guard that keeps the recovery path from deleting a lock that became
+ * valid after it was read: the entry it deletes must still be the entry it
+ * decided about. The interleaving itself is a few instructions wide, so the
+ * predicate is exercised directly against real files.
+ */
+describe("pid-lock file identity", () => {
+  test("an untouched file is the same entry when stat'ed again", async () => {
+    const home = await mkdtemp(join(tmpdir(), "paseo-pid-same-"));
+    try {
+      const path = join(home, "paseo.pid");
+      await writeFile(path, "");
+
+      expect(isSameFileEntry(await stat(path), await stat(path))).toBe(true);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("a file written to since the first stat is not the same entry", async () => {
+    const home = await mkdtemp(join(tmpdir(), "paseo-pid-written-"));
+    try {
+      // What the daemon that created the empty lock does a moment later.
+      const path = join(home, "paseo.pid");
+      await writeFile(path, "");
+      const beforeWrite = await stat(path);
+
+      await writeFile(path, JSON.stringify({ pid: 4242 }));
+
+      expect(isSameFileEntry(beforeWrite, await stat(path))).toBe(false);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("a file rewritten to the same length at a new time is not the same entry", async () => {
+    const home = await mkdtemp(join(tmpdir(), "paseo-pid-retouched-"));
+    try {
+      const path = join(home, "paseo.pid");
+      await writeFile(path, "aaaa");
+      const beforeRewrite = await stat(path);
+
+      await writeFile(path, "bbbb");
+      const later = new Date(beforeRewrite.mtimeMs + 5_000);
+      await utimes(path, later, later);
+
+      expect(isSameFileEntry(beforeRewrite, await stat(path))).toBe(false);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("a rewrite that keeps the inode and the time is caught by the size", async () => {
+    const home = await mkdtemp(join(tmpdir(), "paseo-pid-grew-"));
+    try {
+      // Exactly the case the guard exists for: the daemon that created the
+      // empty lock fills it in. Same file, same clock reading, more bytes.
+      // Pin the time on both sides: utimes rounds to whole milliseconds, so a
+      // time read back from stat cannot be written again unchanged.
+      const pinned = new Date(1_700_000_000_000);
+      const path = join(home, "paseo.pid");
+      await writeFile(path, "");
+      await utimes(path, pinned, pinned);
+      const beforeFill = await stat(path);
+
+      await writeFile(path, JSON.stringify({ pid: 4242 }));
+      await utimes(path, pinned, pinned);
+
+      const afterFill = await stat(path);
+      expect(afterFill.ino).toBe(beforeFill.ino);
+      expect(afterFill.mtimeMs).toBe(beforeFill.mtimeMs);
+      expect(isSameFileEntry(beforeFill, afterFill)).toBe(false);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("a replacement that keeps the size and the time is caught by the inode", async () => {
+    const home = await mkdtemp(join(tmpdir(), "paseo-pid-swapped-"));
+    try {
+      // Another daemon's exclusive create after the file was removed. Nothing
+      // but the inode distinguishes it from the file that was read.
+      const pinned = new Date(1_700_000_000_000);
+      const path = join(home, "paseo.pid");
+      await writeFile(path, "");
+      await utimes(path, pinned, pinned);
+      const beforeSwap = await stat(path);
+
+      await rm(path);
+      await writeFile(path, "");
+      await utimes(path, pinned, pinned);
+
+      const afterSwap = await stat(path);
+      expect(afterSwap.size).toBe(beforeSwap.size);
+      expect(afterSwap.mtimeMs).toBe(beforeSwap.mtimeMs);
+      expect(afterSwap.ino).not.toBe(beforeSwap.ino);
+      expect(isSameFileEntry(beforeSwap, afterSwap)).toBe(false);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("a replacement at the same path is not the same entry", async () => {
+    const home = await mkdtemp(join(tmpdir(), "paseo-pid-replaced-"));
+    try {
+      // What another daemon's exclusive create leaves after the file is gone:
+      // same path, same contents, different inode.
+      const path = join(home, "paseo.pid");
+      await writeFile(path, "");
+      const beforeReplace = await stat(path);
+
+      await rm(path);
+      await writeFile(path, "");
+
+      expect(isSameFileEntry(beforeReplace, await stat(path))).toBe(false);
+    } finally {
+      await rm(home, { recursive: true, force: true });
     }
   });
 });

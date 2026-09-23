@@ -1877,8 +1877,12 @@ export class ACPAgentSession implements AgentSession, ACPClient {
         this.handlePromptResponse(response, turnId);
         return;
       })
-      .catch((error) => {
+      .catch(async (error) => {
         const summary = summarizeACPRequestError(error);
+        // A server that logs and then fails can have both reach us in one I/O
+        // phase, with the response handled first. Let that phase's stderr land
+        // before the diagnostic reads it.
+        await new Promise((resolve) => setImmediate(resolve));
         this.finishTurn({
           type: "turn_failed",
           provider: this.provider,

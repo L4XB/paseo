@@ -37,11 +37,9 @@ rl.on("line", (line) => {
   }
   if (message.method === "session/prompt") {
     process.stderr.write("could not find doneCh for checkpoint\\n");
-    setTimeout(() => {
-      process.stdout.write(
-        JSON.stringify({ jsonrpc: "2.0", id: message.id, error: { code: -32000, message: "Agent execution error" } }) + "\\n",
-      );
-    }, 10);
+    process.stdout.write(
+      JSON.stringify({ jsonrpc: "2.0", id: message.id, error: { code: -32000, message: "Agent execution error" } }) + "\\n",
+    );
     return;
   }
   if (message.id !== undefined) reply(message.id, {});

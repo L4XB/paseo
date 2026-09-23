@@ -3141,9 +3141,13 @@ describe("ACPAgentSession", () => {
 
     const { turnId } = await session.startTurn("hello");
 
+    const turnFailed = new Promise<void>((resolve) => {
+      session.subscribe((event) => {
+        if (event.type === "turn_failed") resolve();
+      });
+    });
     rejectPrompt(new Error("prompt failed"));
-    await Promise.resolve();
-    await Promise.resolve();
+    await turnFailed;
 
     const turnFailedEvent = events.find((event) => event.type === "turn_failed");
     expect(turnFailedEvent).toMatchObject({
@@ -3180,9 +3184,13 @@ describe("ACPAgentSession", () => {
       } as SessionUpdate,
     });
 
+    const turnFailed = new Promise<void>((resolve) => {
+      session.subscribe((event) => {
+        if (event.type === "turn_failed") resolve();
+      });
+    });
     rejectPrompt(new Error("prompt failed"));
-    await Promise.resolve();
-    await Promise.resolve();
+    await turnFailed;
 
     expect(
       events.filter((event) => event.type === "timeline" || event.type === "turn_failed"),

@@ -255,6 +255,23 @@ try {
           details: 'Use "paseo ls" to list available agents',
         },
       });
+
+      // Only a missing agent is AGENT_NOT_FOUND. Any other failed lookup, here the
+      // daemon refusing a prefix that 201 agents share, comes through as is.
+      const ambiguous = await runPaseoCli(daemon, [
+        "agent",
+        "archive",
+        "aaaaaaaa",
+        "--json",
+        "--host",
+        host,
+      ]);
+      assert.strictEqual(ambiguous.exitCode, 1);
+      const ambiguousError = (
+        parseJsonError(ambiguous.stderr) as { error: { code: string; message: string } }
+      ).error;
+      assert.notStrictEqual(ambiguousError.code, "AGENT_NOT_FOUND");
+      assert.match(ambiguousError.message, /is ambiguous/);
     } finally {
       await daemon.stop();
     }

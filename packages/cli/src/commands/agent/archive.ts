@@ -1,5 +1,4 @@
 import { Command } from "commander";
-import { DaemonConnectionError } from "@getpaseo/client/internal/daemon-client";
 import { connectToDaemon } from "../../utils/client.js";
 import type {
   CommandOptions,
@@ -64,11 +63,14 @@ export async function runArchiveCommand(
     });
 
     // Resolve through the daemon rather than a fetchAgents page: that listing is
-    // capped at 200 entries, so an agent behind the cap is unarchivable. An
-    // identifier the daemon cannot resolve comes back as a rejected lookup.
+    // capped at 200 entries, so an agent behind the cap is unarchivable. The
+    // daemon reports an unknown identifier only as an error string, so that one
+    // rejection is recognized by its text; any other failure is rethrown as is.
     const fetchResult = await client.fetchAgent({ agentId: agentIdArg }).catch((cause: unknown) => {
-      if (cause instanceof DaemonConnectionError) throw cause;
-      throw notFound(cause instanceof Error ? cause.message : `Agent not found: ${agentIdArg}`);
+      if (cause instanceof Error && cause.message.startsWith("Agent not found: ")) {
+        throw notFound(cause.message);
+      }
+      throw cause;
     });
     if (!fetchResult) {
       throw notFound(`Agent not found: ${agentIdArg}`);

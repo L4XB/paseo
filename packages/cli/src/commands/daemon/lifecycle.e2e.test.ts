@@ -5,7 +5,8 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { startDaemonInstance, readDaemonInstance } from "@getpaseo/server";
+import { hashDaemonPassword } from "@getpaseo/server/auth";
+import { startDaemonInstance, readDaemonInstance } from "@getpaseo/server/daemon-control";
 import { expect, test } from "vitest";
 import { connectToDaemon } from "../../utils/client.js";
 
@@ -76,11 +77,12 @@ async function fixture() {
       .poll(
         async () => {
           status = await ok(["status", "--home", home], overrides);
-          return status.connectedDaemon;
+          return status;
         },
         { timeout: 30_000 },
       )
-      .toBe("reachable");
+      // A connected socket can outlive a status RPC timeout without reporting the worker.
+      .toMatchObject({ connectedDaemon: "reachable", workerPid: expect.any(Number) });
     return status;
   }
   async function configure(home: string, listen: string) {
@@ -132,7 +134,7 @@ test("managed two-home restart retains its supervisor and never routes ordinary 
     expect(launchA.listen).toBe(`127.0.0.1:${portA}`);
     expect(launchB.listen).toBe(`127.0.0.1:${portB}`);
     const beforeA = await f.liveStatus(a);
-    const beforeB = await f.ok(["--home", b, "daemon", "status"], poisoned);
+    const beforeB = await f.liveStatus(b, poisoned);
     if (process.platform !== "win32") {
       for (const home of [a, b, path.join(f.root, ".paseo")])
         expect((await stat(home)).mode & 0o777).toBe(0o700);
@@ -194,6 +196,26 @@ test("removed flags and ambiguous targets fail before side effects; observation 
     await f.close();
   }
 }, 30_000);
+
+test("status reports the server id of a password-protected daemon to a caller without the password", async () => {
+  const f = await fixture();
+  const home = f.homes[0]!;
+  try {
+    await f.configure(home, `127.0.0.1:${await port()}`);
+    const configPath = path.join(home, "config.json");
+    const config = JSON.parse(await readFile(configPath, "utf8"));
+    config.daemon.auth = { password: await hashDaemonPassword("secret") };
+    await writeFile(configPath, JSON.stringify(config));
+    await f.ok(["start", "--home", home, "--timeout", "30"]);
+    const authenticated = await f.liveStatus(home, { PASEO_PASSWORD: "secret" });
+    expect(await f.ok(["daemon", "status", "--home", home])).toMatchObject({
+      connectedDaemon: "auth_required",
+      serverId: authenticated.serverId,
+    });
+  } finally {
+    await f.close();
+  }
+}, 60_000);
 
 test("an occupied initial or replacement address fails without false readiness or killing its owner", async () => {
   const f = await fixture();
@@ -586,6 +608,25 @@ test("malformed configuration cannot turn a readiness timeout into launch cancel
     await f.ok(["status", "--home", home]);
   } finally {
     if (starter?.exitCode === null) starter.kill("SIGTERM");
+    await f.close();
+  }
+}, 60_000);
+
+test("a background start that fails before the supervisor logs names the cause in a log that exists", async () => {
+  const f = await fixture();
+  const home = f.homes[0]!;
+  const configPath = path.join(home, "config.json");
+  try {
+    await mkdir(home, { recursive: true });
+    await writeFile(configPath, '{"version":1,');
+    const failed = await f.run(["daemon", "start", "--home", home, "--timeout", "30"]);
+    expect(failed.code).toBe(1);
+    expect(failed.stderr).toContain(`Logs: ${path.join(home, "daemon.log")}`);
+    expect(failed.stderr).toContain(`Invalid JSON in ${configPath}`);
+    expect(await readFile(path.join(home, "daemon.log"), "utf8")).toContain(
+      `Invalid JSON in ${configPath}`,
+    );
+  } finally {
     await f.close();
   }
 }, 60_000);

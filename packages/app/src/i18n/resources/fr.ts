@@ -2,6 +2,30 @@ import { en, type TranslationResources } from "./en";
 import { pluginSettings } from "./plugin-settings";
 
 export const fr: TranslationResources = {
+  paneFind: {
+    connectionFailure:
+      "Impossible de rechercher dans cette conversation. Vérifiez la connexion à l’hôte et réessayez.",
+    historyChangedFailure: "La conversation a changé pendant la recherche. Relancez la recherche.",
+    revealFailure: "Impossible d’afficher ce résultat. Réessayez.",
+    searching: "Recherche…",
+    loading: "Chargement…",
+    failed: "Échec",
+    retry: "Réessayer",
+
+    title: "Rechercher",
+    placeholder: "Rechercher dans le panneau",
+    close: "Fermer la recherche",
+    matches: "Résultats de recherche",
+    previous: "Résultat précédent",
+    next: "Résultat suivant",
+    toggleReplace: "Afficher le remplacement",
+    replaceWith: "Remplacer par",
+    replace: "Remplacer",
+    replaceAll: "Tout remplacer",
+    noMatches: "Aucun résultat",
+    position: "{{current}} sur {{total}}",
+    total: "{{total}} résultats",
+  },
   common: {
     back: "Dos",
     loading: "Chargement...",
@@ -229,7 +253,8 @@ export const fr: TranslationResources = {
     states: {
       notFound: "Agentintrouvable",
       failedToLoad: "Échec du chargement de l'agent",
-      reconnecting: "Reconnexion",
+      reconnecting: "Reconnexion à l’hôte",
+      updating: "Mise à jour des messages",
       timelineSyncFailed: "Impossible d’actualiser l’historique de l’agent.",
       timelineSyncRetrying: "Nouvelle tentative…",
       archivingTitle: "Agent d'archivage...",
@@ -915,6 +940,9 @@ export const fr: TranslationResources = {
         openChangesTab: "Ouvrir l'onglet Modifications",
         openDiffTab: "Ouvrir l'onglet Diff",
         closeChangesTab: "Fermer l'onglet Modifications",
+        jumpToFile: {
+          title: "Aller au fichier",
+        },
         binaryFile: "Fichier binaire",
         tooLarge: "Diff trop grand pour être affiché",
         previewTooLargeTitle: "Ce diff est trop volumineux pour être prévisualisé",

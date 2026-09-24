@@ -10,6 +10,7 @@ import * as pluginProviderRuntime from "@getpaseo/plugin/server/provider";
 import * as pluginAcpRuntime from "@getpaseo/plugin/server/acp";
 import type { SettingsDefinition, PluginRpcContract } from "@getpaseo/plugin";
 import type { PluginHandlerContext } from "@getpaseo/plugin/server";
+import type { ZodType } from "zod";
 import {
   ProviderEventSchema,
   type ProviderConnection,
@@ -23,7 +24,7 @@ import { createPluginClientId } from "./plugin-session-identity.js";
 
 import { PluginSettingsStore } from "./settings/index.js";
 let settingsStore: PluginSettingsStore | null = null;
-function registerSettings(definition: SettingsDefinition) {
+function registerSettings<Schema extends ZodType>(definition: SettingsDefinition<Schema>) {
   if (!settingsStore) throw new Error("Plugin settings storage is unavailable");
   const handlers = settingsStore.register(definition);
   register(handlers.read.contract, handlers.read.handle);
@@ -33,6 +34,7 @@ function registerSettings(definition: SettingsDefinition) {
   register(handlers.reset.contract, (input) =>
     handlers.reset.handle(handlers.reset.contract.input.parse(input)),
   );
+  return handlers.settings;
 }
 
 type RpcHandler = (input: unknown, context: PluginHandlerContext) => unknown | Promise<unknown>;
@@ -49,7 +51,7 @@ const handlers = new Map<string, RegisteredRpc>();
 const providers = new Map<string, ProviderRegistration>();
 const providerConnections = new Map<
   string,
-  { connection: ProviderConnection; unsubscribe: () => void }
+  { connection: ProviderConnection; unsubscribe: () => void; closing?: Promise<void> }
 >();
 const pendingProviderConnections = new Map<string, { tombstoned: boolean }>();
 let cleanup: (() => void | Promise<void>) | null = null;
@@ -191,6 +193,7 @@ async function sendProviderInput(
   if (stopping) throw new Error("Plugin is stopping");
   const current = providerConnections.get(message.connectionId);
   if (!current) throw new Error(`Unknown provider connection: ${message.connectionId}`);
+  if (current.closing) throw new Error("Provider connection is closing");
   await current.connection.send(message.input);
   send({
     type: "provider.accepted",
@@ -199,13 +202,25 @@ async function sendProviderInput(
   });
 }
 
+// The connection stays registered until its close has reported, so shutdown
+// waits for a close already in flight instead of disconnecting underneath it.
 async function closeProviderConnection(connectionId: string): Promise<void> {
   const current = providerConnections.get(connectionId);
   if (!current) return;
-  providerConnections.delete(connectionId);
-  current.unsubscribe();
-  await current.connection.close();
-  send({ type: "provider.closed", connectionId });
+  if (current.closing) return current.closing;
+  const closing = (async () => {
+    current.unsubscribe();
+    try {
+      await current.connection.close();
+      send({ type: "provider.closed", connectionId });
+    } catch (error) {
+      send({ type: "provider.closed", connectionId, error: describeError(error) });
+    } finally {
+      providerConnections.delete(connectionId);
+    }
+  })();
+  current.closing = closing;
+  return closing;
 }
 
 function runtimeRequire(name: string): unknown {
@@ -258,7 +273,8 @@ async function initialize(message: Extract<PluginProcessRequest, { type: "initia
     clientId: createPluginClientId(message.pluginId),
     clientType: "cli",
     appVersion: message.appVersion,
-    reconnect: { enabled: false },
+    // The runtime re-attaches a session when the daemon drops this socket.
+    reconnect: { enabled: true },
     transportFactory,
   });
   paseo = createPaseoApi(daemonClient);
@@ -394,13 +410,7 @@ process.on("message", (rawMessage: unknown) => {
     return;
   }
   if (message.type === "provider.close") {
-    void closeProviderConnection(message.connectionId).catch((error) => {
-      send({
-        type: "provider.closed",
-        connectionId: message.connectionId,
-        error: describeError(error),
-      });
-    });
+    void closeProviderConnection(message.connectionId);
     return;
   }
   if (message.type === "paseo_frame" || message.type === "paseo_close") return;

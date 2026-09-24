@@ -1887,6 +1887,11 @@ export class ACPAgentSession implements AgentSession, ACPClient {
         // phase, with the response handled first. Let that phase's stderr land
         // before the diagnostic reads it.
         await new Promise((resolve) => setImmediate(resolve));
+        // The process can exit in that pause, and its exit handler has then
+        // failed this turn already; a turn gets one terminal event.
+        if (this.activeForegroundTurnId !== turnId) {
+          return;
+        }
         this.finishTurn({
           type: "turn_failed",
           provider: this.provider,

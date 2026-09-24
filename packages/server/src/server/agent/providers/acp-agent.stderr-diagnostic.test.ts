@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import type { AgentStreamEvent } from "../agent-sdk-types.js";
@@ -39,6 +39,9 @@ rl.on("line", (line) => {
     process.stderr.write("could not find doneCh for checkpoint\\n");
     process.stdout.write(
       JSON.stringify({ jsonrpc: "2.0", id: message.id, error: { code: -32000, message: "Agent execution error" } }) + "\\n",
+      () => {
+        if (JSON.stringify(message.params?.prompt).includes("EXIT_AFTER_ERROR")) process.exit(1);
+      },
     );
     return;
   }
@@ -68,6 +71,17 @@ function nextTurnFailure(
       if (event.type === "turn_failed") resolve(event);
     });
   });
+}
+
+/** Every `turn_failed` the session emits, in order. */
+function collectTurnFailures(
+  session: ACPAgentSession,
+): Extract<AgentStreamEvent, { type: "turn_failed" }>[] {
+  const failures: Extract<AgentStreamEvent, { type: "turn_failed" }>[] = [];
+  session.subscribe((event) => {
+    if (event.type === "turn_failed") failures.push(event);
+  });
+  return failures;
 }
 
 function createSession(scriptPath: string, cwd: string): ACPAgentSession {
@@ -101,6 +115,35 @@ describe("ACP turn failure diagnostics", () => {
         await session.startTurn("hello");
         expect((await failed).diagnostic).toContain("could not find doneCh for checkpoint");
       } finally {
+        await session.close();
+      }
+    });
+  }, 20_000);
+
+  test("a turn the process exit already failed is not failed a second time", async () => {
+    await withFakeAgent(async (scriptPath, cwd) => {
+      const session = createSession(scriptPath, cwd);
+      await session.initializeNewSession();
+      const failures = collectTurnFailures(session);
+
+      // Park the prompt error's continuation, whichever of the error and the
+      // exit arrives first, so the exit handler fails the turn before it runs.
+      vi.useFakeTimers({ toFake: ["setImmediate"] });
+      try {
+        const { turnId } = await session.startTurn("EXIT_AFTER_ERROR");
+        // Not vi.waitFor: under fake timers it advances them, which would
+        // release the continuation early.
+        while (failures.length === 0 || vi.getTimerCount() === 0) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        vi.runAllTimers();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+
+        expect(failures).toHaveLength(1);
+        expect(failures[0].turnId).toBe(turnId);
+        expect(failures[0].error).toBe("ACP agent exited unexpectedly (1)");
+      } finally {
+        vi.useRealTimers();
         await session.close();
       }
     });
